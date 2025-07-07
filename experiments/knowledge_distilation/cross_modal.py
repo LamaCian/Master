@@ -47,6 +47,7 @@ class CrossModalTrainer:
                  unfreeze_layers: int = 1,
                  patience: int = 5):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.logit_scale = torch.nn.Parameter(torch.ones([]) * torch.log(torch.tensor(1/0.07)))
 
         # Models
         self.student = student.to(self.device)
@@ -61,11 +62,12 @@ class CrossModalTrainer:
         for p in self.student.projection.parameters():
             p.requires_grad = True
 
-        # Optimizer: only projection head at first
         self.optimizer = torch.optim.Adam(
-            self.student.projection.parameters(), lr=lr_proj
+            [{'params': self.student.projection.parameters(), 'lr': lr_proj}],
+            betas=(0.9, 0.98)
         )
         self.lr_ft = lr_ft
+        self.lr_proj = lr_proj
         self.unfreeze_epoch = unfreeze_epoch
         self.unfreeze_layers = unfreeze_layers
 
@@ -129,7 +131,12 @@ class CrossModalTrainer:
                 except ValueError:
                     pass
 
-        # rebuild optimiser …
+        params = [
+            {'params': self.student.projection.parameters(), 'lr': self.lr_proj},
+            {'params': [p for p in self.student.text_encoder.parameters() if p.requires_grad], 'lr': self.lr_ft},
+            {'params': [p for p in self.vision.parameters() if p.requires_grad], 'lr': self.lr_ft},
+        ]
+        self.optimizer = torch.optim.Adam(params, betas=(0.9, 0.98))
 
     def forward(self, batch):
         imgs = batch["pixel_values"].to(self.device)
@@ -138,8 +145,9 @@ class CrossModalTrainer:
             "attention_mask": batch["attention_mask"].to(self.device)
         }
 
-        with torch.no_grad():
-            v = self.vision(imgs)[1]           # pooled 512-d
+        # with torch.no_grad():
+        #     v = self.vision(imgs)[1]           # pooled 512-d
+        v = self.vision(imgs)[1]           # pooled 512-d
         v = F.normalize(v, dim=1)
 
         # Student text embeddings
@@ -148,22 +156,34 @@ class CrossModalTrainer:
         s = self.student.projection(pooled)    # (B,512)
         s = F.normalize(s, dim=1)
 
-        sim = v @ s.T                        # (B, B)
+        # sim = v @ s.T                        # (B, B)
+        scale = self.logit_scale.exp()
+        sim = (v @ s.T) * scale
         return sim
 
     def validate(self, loader: DataLoader):
-        self.student.eval(); self.vision.eval()
+        self.student.eval();
+        self.vision.eval()
         total, count = 0.0, 0
         with torch.no_grad():
             for batch in loader:
                 sim = self.forward(batch)
                 total += self.criterion(sim).item()
                 count += 1
-        return total / count
+            if count == 0:
+                raise RuntimeError("No validation batches!")
+            return total / count
 
-    def train(self, train_loader: DataLoader, val_loader: DataLoader,
-              epochs: int, save_path: str):
-        for ep in range(epochs):
+    def train(self,
+              train_loader: DataLoader,
+              val_loader: DataLoader,
+              epochs: int,
+              save_path: str,
+              start_epoch: int = 0,
+              ):
+
+        for ep in range(start_epoch, epochs):
+
             if ep == self.unfreeze_epoch:
                 logging.info(f"Unfreezing at epoch {ep}")
                 self._unfreeze()
@@ -188,15 +208,27 @@ class CrossModalTrainer:
             self.val_history.append(val_loss)
             logging.info(f"Epoch {ep+1}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
 
-            if val_loss < self.best_loss:
-                self.best_loss       = val_loss
+            if val_loss <= self.best_loss:
+                self.best_loss  = val_loss
                 self.epochs_wo_improve = 0
                 self.best_states    = {
                     "student": self.student.state_dict(),
                     "vision":  self.vision.state_dict()
                 }
+                ckpt = {
+                    "student": self.student.state_dict(),
+                    "vision": self.vision.state_dict(),
+                    "optimizer": self.optimizer.state_dict(),
+                    "epochs":ep,
+                    "epochs_wo_improve":self.epochs_wo_improve,
+                    "best_loss": self.best_loss,
+
+                }
+
+                logging.info(f"Saving checkpoint at epoch {ep+1}, best loss={ckpt['best_loss']:.4f}")
+
                 os.makedirs(save_path, exist_ok=True)
-                torch.save(self.best_states,
+                torch.save(ckpt,
                            os.path.join(save_path, f"clip_model_{arrow.now().format('YYYY-MM-DD-HH-mm')}.pt"))
             else:
                 self.epochs_wo_improve += 1
@@ -208,12 +240,26 @@ class CrossModalTrainer:
         plt.plot(self.train_history, label="train")
         plt.plot(self.val_history,   label="val")
         plt.legend()
-        plt.savefig(os.path.join(save_path, "loss_curves.png"))
+        plt.savefig(os.path.join(save_path, f"loss_curves_{arrow.now()}.png"))
         plt.close()
 
         return self.best_states
 
 if __name__ == "__main__":
+    import argparse
+    from batch_sampler import UniqueSampler
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--resume", "-r",
+        type=str,
+        default=None,
+        help="Path to a checkpoint .pt file to resume from"
+    )
+    args = parser.parse_args()
+
+
+
     base = get_root_directory()
 
     # 1) load text student
@@ -234,8 +280,18 @@ if __name__ == "__main__":
     )
     tr_sz = int(0.8 * len(ds))
     train_ds, val_ds = random_split(ds, [tr_sz, len(ds) - tr_sz])
-    tr_ld = DataLoader(train_ds, batch_size=128, shuffle=True, collate_fn=ImageTextCollate())
-    vl_ld = DataLoader(val_ds,   batch_size=128, shuffle=False,collate_fn=ImageTextCollate())
+    global_caption_ids = [item["caption_id"] for item in ds.items]
+    val_caption_ids = [global_caption_ids[i] for i in val_ds.indices]
+    train_caption_ids = [global_caption_ids[i] for i in train_ds.indices]
+
+    train_sampler = UniqueSampler(caption_ids=train_caption_ids,
+                            batch_size=128)
+
+    val_sampler = UniqueSampler(caption_ids=val_caption_ids,
+                                batch_size=128)
+
+    tr_ld = DataLoader(train_ds, batch_sampler=train_sampler, collate_fn=ImageTextCollate())
+    vl_ld = DataLoader(val_ds,  batch_sampler=val_sampler, collate_fn=ImageTextCollate())
 
     # 4) train
     trainer = CrossModalTrainer(
@@ -243,9 +299,43 @@ if __name__ == "__main__":
         vision=vision,
         lr_proj=3e-5,
         lr_ft=1e-6,
-        unfreeze_epoch=60,
-        unfreeze_layers=1,
-        patience=3
+        unfreeze_epoch=65,
+        unfreeze_layers=2,
+        patience=5
     )
-    trainer.train(tr_ld, vl_ld, epochs=100,
+
+    start_epoch = 0
+    ckpt_trained_path = f'{base}/models/trained/crossmodal/clip_model_2025-07-03-20-37.pt'
+    if ckpt_trained_path:
+        ckpt_trained = torch.load(ckpt_trained_path)
+        trainer.student.load_state_dict(ckpt_trained["student"])
+        trainer.vision.load_state_dict(ckpt_trained["vision"])
+
+        trainer.optimizer = torch.optim.Adam(
+            trainer.student.projection.parameters(),
+            lr=ckpt_trained.get("lr_proj", 3e-5)
+        )
+
+        if "optimizer" in ckpt_trained:
+            trainer.optimizer.load_state_dict(ckpt_trained["optimizer"])
+
+            for state in trainer.optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(trainer.device)
+
+        trainer.train_history = ckpt_trained["train_history"] if "train_history" in ckpt_trained else trainer.train_history
+        trainer.val_history = ckpt_trained["val_history"] if "val_history" in ckpt_trained else trainer.val_history
+        trainer.best_loss = ckpt_trained["best_loss"] if "best_loss" in ckpt_trained else trainer.best_loss
+        start_epoch = ckpt_trained["epochs"] + 1 if "epochs" in ckpt_trained else start_epoch
+        trainer.epochs_wo_improve = ckpt_trained['epochs_wo_improve'] if "epochs_wo_improve" in ckpt_trained else 0
+        logging.info(f"Resuming from epoch {start_epoch}")
+        logging.info("Best loss: {}".format(trainer.best_loss))
+
+
+
+    trainer.train(train_loader=tr_ld,
+                  val_loader=vl_ld,
+                  epochs=200,
+                  start_epoch=start_epoch,
                   save_path=f"{base}/models/trained/crossmodal/")

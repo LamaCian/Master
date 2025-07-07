@@ -32,7 +32,6 @@ class Distilationcollate:
         serbian_padded = pad_sequence(serbian_inputs, batch_first=True,
                                       padding_value=self.student_tokenizer.pad_token_id)
 
-        # Create attention masks
         english_attention_masks = (english_padded != self.teacher_tokenizer.pad_token_id).long()
         serbian_attention_masks = (serbian_padded != self.student_tokenizer.pad_token_id).long()
 
@@ -143,10 +142,8 @@ class DistillationDataset(Dataset):
         else:
             self.full_dataset = dataset
 
-        # Initialize with full indices
         self.indices = list(range(len(self.full_dataset)))
 
-        # Extract and process categories
         self.category_field = category_field
         self._process_categories()
 
@@ -166,10 +163,8 @@ class DistillationDataset(Dataset):
             self.unique_categories.add(category)
             self.category_counts[category] += 1
 
-        # Convert to sorted list for reproducibility
         self.unique_categories = sorted(self.unique_categories)
 
-        # Validate we have enough samples per category
         min_samples = min(self.category_counts.values())
         if min_samples < 2:
             logging.warning(f"Some categories have very few samples (minimum: {min_samples})")

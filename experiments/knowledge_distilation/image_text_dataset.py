@@ -1,4 +1,3 @@
-from huggingface_hub import upload_file
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from transformers import CLIPImageProcessor
@@ -7,7 +6,7 @@ import torch
 from helpers.helper import get_root_directory, cast_csv_to_dict, load_json
 import logging
 import ast
-
+from batch_sampler import UniqueSampler
 logging.basicConfig(level=logging.INFO)
 
 
@@ -30,15 +29,17 @@ class ImageTextDataset(Dataset):
             caption_col = [caption_col]
 
         self.items = []
-        for row in self.dataset:
+        for i, row in enumerate(self.dataset):
             img_paths = self._parse_image_paths(row[image_col])
             if not img_paths:
                 continue
-            img_path = img_paths[0]
-            for col in caption_col:
-                txt = row.get(col, None)
-                if txt:
-                    self.items.append({"image": img_path, "text": txt})
+            for img_path in img_paths:
+                for col in caption_col:
+                    txt = row.get(col, None)
+                    if txt:
+                        self.items.append({"image": img_path,
+                                           "text": txt,
+                                           "caption_id":i})
 
         self.tokenizer = tokenizer
         if image_transform:
@@ -87,7 +88,6 @@ class ImageTextDataset(Dataset):
                                      padding='max_length',
                                      truncation=True,
                                      max_length=77)
-        logging.info("Successfully tokenized image and text inputs: " + item['text'])
 
         return {'image': image,
                 'input_ids': text_inputs['input_ids'].squeeze(0),
@@ -139,10 +139,18 @@ if __name__ == '__main__':
     dataset = ImageTextDataset(
         dataset=f'{get_root_directory()}/Parsing/zara/clothes_combined.csv',
         tokenizer=student_tokenizer,
-        image_col='Local Images',
+        image_col='Local files',
         caption_col='Description')
 
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=ImageTextCollate())
+    caption_ids = [it["caption_id"] for it in dataset.items]
+
+    sampler = UniqueSampler(caption_ids=caption_ids,
+                            batch_size=32,
+                            drop_last=False
+                            )
+    dataloader = DataLoader(dataset,
+                            collate_fn=ImageTextCollate(),
+                            batch_sampler=sampler)
 
     for btch in dataloader:
         pixel_values, input_ids, attention_mask = btch['pixel_values'], btch['input_ids'], btch['attention_mask']
